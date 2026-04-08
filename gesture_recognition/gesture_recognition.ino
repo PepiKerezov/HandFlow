@@ -16,11 +16,18 @@
  *   SWIPE_DIAG_DR  ↘    горе-ляво → долу-дясно
  *   SWIPE_DIAG_UL  ↖    долу-дясно → горе-ляво
  *   SWIPE_DIAG_DL  ↙    горе-дясно → долу-ляво
+ *   VERTICAL_UP    ↑    ръката се вдига (разстоянието расте)
+ *   VERTICAL_DOWN  ↓    ръката се снишава (разстоянието намалява)
  *
- * Диагонал: определя се от разликата в разстоянието между
- * LEFT и RIGHT в момента на начало на жеста.
- * Малко разстояние = ръката е ниско/близо до сензора.
- * Голямо разстояние = ръката е нагоре/далеч.
+ * Диагонал: определя се от минималното разстояние на LEFT и RIGHT
+ * по време на целия swipe (не само при начало).
+ * По-малко разстояние = ръката е ниско/близо до сензора.
+ * По-голямо разстояние = ръката е нагоре/далеч.
+ *
+ * Вертикал: засича се когато swipe-ът изтече, но ръката е все
+ * още над сензорите. Следи се най-близкото разстояние от всичките
+ * три сензора, тъй като ръката не може да покрие всичките три
+ * едновременно (физически разстояния между тях).
  */
 
 #include <Arduino.h>
@@ -33,7 +40,6 @@
 #define SerialPort Serial
 
 // ── STMPE1600 GPIO expander-и ────────────────────────────────────
-// Адресите са × 2 защото ST библиотеката очаква 8-bit формат
 // U19 @ 0x42 → GPIO_15 = XSHUT CENTER
 // U21 @ 0x43 → GPIO_14 = XSHUT LEFT
 //            → GPIO_15 = XSHUT RIGHT
@@ -50,16 +56,46 @@ VL53L0X_X_NUCLEO_53L0A1 sensor_right (&Wire, &xshutdown_right);
 Gesture_DIRSWIPE_1_Data_t gestureDirSwipeData;
 
 // ── Разстояния ───────────────────────────────────────────────────
-uint32_t distance_left, distance_right;
+uint32_t distance_left = 1200, distance_center = 1200, distance_right = 1200;
 
-// ── Диагонален snapshot ──────────────────────────────────────────
-// Записваме L/R разстоянията при ПЪРВОТО засичане на ръката,
-// за да определим наклона на жеста след като ST lib го потвърди.
-#define DIAG_THRESHOLD_MM  20   // мин. разлика за диагонал
-#define HAND_PRESENT_MM   400   // под това = ръка пред сензора
+// ── Параметри ────────────────────────────────────────────────────
+#define HAND_PRESENT_MM      400   // под това = ръка пред сензора
+#define DIAG_THRESHOLD_MM     40   // мин. разлика minL/minR за диагонал
+#define SWIPE_TIMEOUT_MS    1200   // изчакване за ST lib swipe (> 1000ms прозорец)
+#define VERTICAL_TIMEOUT_MS 2000   // макс. престой в VERTICAL_CHECK
+#define VERTICAL_THRESHOLD_MM 30   // мин. промяна на разстоянието за вертикал
+#define COOLDOWN_TIMEOUT_MS  500   // макс. време в COOLDOWN преди принудителен IDLE
+#define HAND_DETECT_FRAMES     3   // последователни кадри за потвърждение на ръка
 
-uint32_t snapL = 0, snapR = 0;
-bool     snapshotTaken = false;
+// ── State machine ─────────────────────────────────────────────────
+enum State { IDLE, SWIPE_DETECT, VERTICAL_CHECK, COOLDOWN };
+State state = IDLE;
+
+// ── Swipe tracking ────────────────────────────────────────────────
+uint32_t minL, minR;          // мин. разстояние от всяка страна по време на swipe
+unsigned long swipeStartTime;
+
+// ── Vertical tracking ─────────────────────────────────────────────
+uint32_t vertStartDist;       // разстояние при влизане в VERTICAL_CHECK
+uint32_t vertLastDist;        // последното валидно "closest" разстояние
+unsigned long vertStartTime;
+unsigned long cooldownStartTime;
+uint8_t handDetectCount = 0;      // брой последователни кадри с ръка (debounce)
+
+// ════════════════════════════════════════════════════════════════
+// Помощна функция: чете разстоянието на даден сензор (single-shot)
+// ════════════════════════════════════════════════════════════════
+uint32_t readSensor(VL53L0X_X_NUCLEO_53L0A1 &sensor) {
+  sensor.StartMeasurement();
+  uint8_t ready = 0;
+  VL53L0X_RangingMeasurementData_t data;
+  do {
+    sensor.GetMeasurementDataReady(&ready);
+  } while (!ready);
+  sensor.ClearInterruptMask(0);
+  sensor.GetRangingMeasurementData(&data);
+  return (data.RangeStatus == 0) ? data.RangeMilliMeter : 1200;
+}
 
 // ════════════════════════════════════════════════════════════════
 // Single-shot setup — идентично с официалния ST пример
@@ -79,29 +115,94 @@ void setupSingleShot() {
 }
 
 // ════════════════════════════════════════════════════════════════
-// Диагонална класификация върху вече разпознат swipe от ST lib
+// Четене на всичките три сензора паралелно
+// ════════════════════════════════════════════════════════════════
+void readAllSensors() {
+  sensor_left.StartMeasurement();
+  sensor_right.StartMeasurement();
+  sensor_center.StartMeasurement();
+
+  int left_done = 0, right_done = 0, center_done = 0;
+  uint8_t ready = 0;
+  VL53L0X_RangingMeasurementData_t data;
+
+  do {
+    if (!left_done) {
+      ready = 0;
+      sensor_left.GetMeasurementDataReady(&ready);
+      if (ready) {
+        sensor_left.ClearInterruptMask(0);
+        sensor_left.GetRangingMeasurementData(&data);
+        distance_left = (data.RangeStatus == 0) ? data.RangeMilliMeter : 1200;
+        left_done = 1;
+      }
+    }
+    if (!right_done) {
+      ready = 0;
+      sensor_right.GetMeasurementDataReady(&ready);
+      if (ready) {
+        sensor_right.ClearInterruptMask(0);
+        sensor_right.GetRangingMeasurementData(&data);
+        distance_right = (data.RangeStatus == 0) ? data.RangeMilliMeter : 1200;
+        right_done = 1;
+      }
+    }
+    if (!center_done) {
+      ready = 0;
+      sensor_center.GetMeasurementDataReady(&ready);
+      if (ready) {
+        sensor_center.ClearInterruptMask(0);
+        sensor_center.GetRangingMeasurementData(&data);
+        distance_center = (data.RangeStatus == 0) ? data.RangeMilliMeter : 1200;
+        center_done = 1;
+      }
+    }
+  } while (!left_done || !right_done || !center_done);
+}
+
+// ════════════════════════════════════════════════════════════════
+// Проверка дали ръката е видима от поне един сензор
+// ════════════════════════════════════════════════════════════════
+bool handPresent() {
+  // CENTER сензорът вижда платката и не може да се ползва за детекция
+  return (distance_left  < HAND_PRESENT_MM)
+      || (distance_right < HAND_PRESENT_MM);
+}
+
+// ════════════════════════════════════════════════════════════════
+// Най-близкото разстояние от сензорите, които виждат ръката
+// ════════════════════════════════════════════════════════════════
+uint32_t closestVisible() {
+  // CENTER сензорът вижда платката — ползваме само LEFT и RIGHT
+  uint32_t best = 1200;
+  if (distance_left  < HAND_PRESENT_MM) best = min(best, distance_left);
+  if (distance_right < HAND_PRESENT_MM) best = min(best, distance_right);
+  return best;
+}
+
+// ════════════════════════════════════════════════════════════════
+// Класификация и принтиране на swipe жест
 // ════════════════════════════════════════════════════════════════
 /*
- *   L→R: snapL < snapR → ↗ UR  |  snapL > snapR → ↘ DR
- *   R→L: snapR < snapL → ↖ UL  |  snapR > snapL → ↙ DL
+ * Диагонална логика (от минималните разстояния по цялото движение):
+ *   L→R: minL < minR → ↗ UR  |  minL > minR → ↘ DR
+ *   R→L: minR < minL → ↖ UL  |  minR > minL → ↙ DL
  */
-void printGesture(int gesture_code) {
-  bool diag = snapshotTaken
-           && (snapL < 1000) && (snapR < 1000)
-           && ((uint32_t)abs((int32_t)snapL - (int32_t)snapR) > DIAG_THRESHOLD_MM);
+void printSwipeGesture(int gesture_code) {
+  bool diag = (minL < HAND_PRESENT_MM)
+           && (minR < HAND_PRESENT_MM)
+           && ((uint32_t)abs((int32_t)minL - (int32_t)minR) > DIAG_THRESHOLD_MM);
 
   SerialPort.print(">>> ");
   if (gesture_code == GESTURES_SWIPE_LEFT_RIGHT) {
-    if (!diag)           SerialPort.println("SWIPE_RIGHT    ←→");
-    else if (snapL < snapR) SerialPort.println("SWIPE_DIAG_UR  ↗  долу-ляво → горе-дясно");
-    else                 SerialPort.println("SWIPE_DIAG_DR  ↘  горе-ляво → долу-дясно");
+    if (!diag)              SerialPort.println("SWIPE_RIGHT    ←→");
+    else if (minL < minR)   SerialPort.println("SWIPE_DIAG_UR  ↗  долу-ляво → горе-дясно");
+    else                    SerialPort.println("SWIPE_DIAG_DR  ↘  горе-ляво → долу-дясно");
   } else {
-    if (!diag)           SerialPort.println("SWIPE_LEFT     →←");
-    else if (snapR < snapL) SerialPort.println("SWIPE_DIAG_UL  ↖  долу-дясно → горе-ляво");
-    else                 SerialPort.println("SWIPE_DIAG_DL  ↙  горе-дясно → долу-ляво");
+    if (!diag)              SerialPort.println("SWIPE_LEFT     →←");
+    else if (minR < minL)   SerialPort.println("SWIPE_DIAG_UL  ↖  долу-дясно → горе-ляво");
+    else                    SerialPort.println("SWIPE_DIAG_DL  ↙  горе-дясно → долу-ляво");
   }
-
-  snapshotTaken = false;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -118,7 +219,7 @@ void setup() {
   sensor_left.begin();   sensor_left.VL53L0X_Off();
   sensor_right.begin();  sensor_right.VL53L0X_Off();
 
-  // Remap адреси — идентично с официалния ST пример
+  // Remap адреси
   if (sensor_left.InitSensor(0x12))
     SerialPort.println("ERR: LEFT");
   else
@@ -138,58 +239,110 @@ void setup() {
   tof_gestures_initDIRSWIPE_1(400, 0, 1000, &gestureDirSwipeData);
 
   setupSingleShot();
-  SerialPort.println("\nГотов. Очаква жест...\n");
+
+  // Изчисти остатъчни прекъсвания от калибрацията
+  sensor_left.ClearInterruptMask(0);
+  sensor_right.ClearInterruptMask(0);
+  sensor_center.ClearInterruptMask(0);
+
+  // Едно "загряващо" четене за изчистване на евентуални стари данни
+  readAllSensors();
+
+  SerialPort.println("\nReady.");
 }
 
 // ════════════════════════════════════════════════════════════════
 void loop() {
-  // ── Стартирай LEFT и RIGHT едновременно ─────────────────────
-  sensor_left.StartMeasurement();
-  sensor_right.StartMeasurement();
+  readAllSensors();
 
-  int left_done = 0, right_done = 0;
-  uint8_t ready = 0;
-  VL53L0X_RangingMeasurementData_t data;
-
-  // ── Чакай и двата паралелно — идентично с ST примера ────────
-  do {
-    if (!left_done) {
-      sensor_left.GetMeasurementDataReady(&ready);
-      if (ready) {
-        sensor_left.ClearInterruptMask(0);
-        sensor_left.GetRangingMeasurementData(&data);
-        distance_left  = (data.RangeStatus == 0) ? data.RangeMilliMeter : 1200;
-        left_done = 1;
-      }
-    }
-    if (!right_done) {
-      ready = 0;
-      sensor_right.GetMeasurementDataReady(&ready);
-      if (ready) {
-        sensor_right.ClearInterruptMask(0);
-        sensor_right.GetRangingMeasurementData(&data);
-        distance_right = (data.RangeStatus == 0) ? data.RangeMilliMeter : 1200;
-        right_done = 1;
-      }
-    }
-  } while (!left_done || !right_done);
-
-  // ── Snapshot при начало на присъствие на ръка ────────────────
-  bool handPresent = (distance_left < HAND_PRESENT_MM)
-                  || (distance_right < HAND_PRESENT_MM);
-  if (handPresent && !snapshotTaken) {
-    snapL = distance_left;
-    snapR = distance_right;
-    snapshotTaken = true;
-  }
-  if (!handPresent) snapshotTaken = false;
-
-  // ── ST gesture библиотека ────────────────────────────────────
+  // Винаги подаваме на ST lib (нужда от непрекъснати данни)
   int gesture_code = tof_gestures_detectDIRSWIPE_1(
       distance_left, distance_right, &gestureDirSwipeData);
 
-  if (gesture_code == GESTURES_SWIPE_LEFT_RIGHT ||
-      gesture_code == GESTURES_SWIPE_RIGHT_LEFT) {
-    printGesture(gesture_code);
+  switch (state) {
+
+    // ── IDLE ──────────────────────────────────────────────────────
+    case IDLE:
+      if (handPresent()) {
+        handDetectCount++;
+        SerialPort.print("DETECT L="); SerialPort.print(distance_left);
+        SerialPort.print(" C="); SerialPort.print(distance_center);
+        SerialPort.print(" R="); SerialPort.print(distance_right);
+        SerialPort.print(" #"); SerialPort.println(handDetectCount);
+        if (handDetectCount >= HAND_DETECT_FRAMES) {
+          state = SWIPE_DETECT;
+          swipeStartTime = millis();
+          minL = distance_left;
+          minR = distance_right;
+          handDetectCount = 0;
+        }
+      } else {
+        handDetectCount = 0;
+      }
+      break;
+
+    // ── SWIPE_DETECT ──────────────────────────────────────────────
+    case SWIPE_DETECT:
+      // Обновявай минималните разстояния докато ръката е видима
+      if (distance_left  < HAND_PRESENT_MM) minL = min(minL, distance_left);
+      if (distance_right < HAND_PRESENT_MM) minR = min(minR, distance_right);
+
+      // ST lib засечe swipe?
+      if (gesture_code == GESTURES_SWIPE_LEFT_RIGHT ||
+          gesture_code == GESTURES_SWIPE_RIGHT_LEFT) {
+        printSwipeGesture(gesture_code);
+        state = COOLDOWN;
+        cooldownStartTime = millis();
+        break;
+      }
+
+      // Изтекъл ли е прозорецът?
+      if (millis() - swipeStartTime > SWIPE_TIMEOUT_MS) {
+        if (handPresent()) {
+          // Ръката е все още тук → проверяваме за вертикал
+          state = VERTICAL_CHECK;
+          vertStartTime = millis();
+          vertStartDist = closestVisible();
+          vertLastDist  = vertStartDist;
+        } else {
+          // Ръката е напуснала без swipe → нищо
+          state = IDLE;
+        }
+      }
+      break;
+
+    // ── VERTICAL_CHECK ────────────────────────────────────────────
+    case VERTICAL_CHECK: {
+      if (handPresent()) {
+        vertLastDist = closestVisible();
+      }
+
+      bool timedOut = (millis() - vertStartTime > VERTICAL_TIMEOUT_MS);
+      bool handGone = !handPresent();
+
+      if (handGone || timedOut) {
+        int32_t delta = (int32_t)vertLastDist - (int32_t)vertStartDist;
+        if (delta > (int32_t)VERTICAL_THRESHOLD_MM) {
+          SerialPort.println(">>> VERTICAL_UP    ↑  ръката се вдигна");
+        } else if (delta < -(int32_t)VERTICAL_THRESHOLD_MM) {
+          SerialPort.println(">>> VERTICAL_DOWN  ↓  ръката се сниши");
+        }
+        // Ако delta е в рамките на прага — без жест (само задържане)
+        state = COOLDOWN;
+        cooldownStartTime = millis();
+      }
+      break;
+    }
+
+    // ── COOLDOWN ──────────────────────────────────────────────────
+    case COOLDOWN:
+      // Изчакай докато ръката напусне ИЛИ изтече таймаутът
+      if (!handPresent() || millis() - cooldownStartTime > COOLDOWN_TIMEOUT_MS) {
+        // Нулирай ST lib — данните от движението при вдигане на ръката се изхвърлят
+        tof_gestures_initDIRSWIPE_1(400, 0, 1000, &gestureDirSwipeData);
+        state = IDLE;
+        SerialPort.println("Ready.");
+      }
+      break;
   }
 }
