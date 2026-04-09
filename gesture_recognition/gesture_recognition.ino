@@ -71,6 +71,24 @@ uint32_t distance_left = 1200, distance_center = 1200, distance_right = 1200;
 enum State { IDLE, SWIPE_DETECT, VERTICAL_CHECK, COOLDOWN };
 State state = IDLE;
 
+// ── Move ─────────────────────────────────────────────────
+enum Move {
+  MOVE_NONE,
+  SWIPE_RIGHT,
+  SWIPE_LEFT,
+  SWIPE_DIAG_UR,
+  SWIPE_DIAG_DR,
+  SWIPE_DIAG_UL,
+  SWIPE_DIAG_DL,
+  VERTICAL_UP,
+  VERTICAL_DOWN
+};
+Move currentMove = MOVE_NONE;
+
+// ── Action ─────────────────────────────────────────────────
+enum Action {ACTION_NONE, ACTION_TV, ACTION_LIGHT};
+Action current_action = ACTION_NONE;
+
 // ── Swipe tracking ────────────────────────────────────────────────
 uint32_t minL, minR;          // мин. разстояние от всяка страна по време на swipe
 unsigned long swipeStartTime;
@@ -195,13 +213,13 @@ void printSwipeGesture(int gesture_code) {
 
   SerialPort.print(">>> ");
   if (gesture_code == GESTURES_SWIPE_LEFT_RIGHT) {
-    if (!diag)              SerialPort.println("SWIPE_RIGHT    ←→");
-    else if (minL < minR)   SerialPort.println("SWIPE_DIAG_UR  ↗  долу-ляво → горе-дясно");
-    else                    SerialPort.println("SWIPE_DIAG_DR  ↘  горе-ляво → долу-дясно");
+    if (!diag)            { currentMove = SWIPE_RIGHT;    SerialPort.println("SWIPE_RIGHT    ←→"); }
+    else if (minL < minR) { currentMove = SWIPE_DIAG_UR;  SerialPort.println("SWIPE_DIAG_UR  ↗  долу-ляво → горе-дясно"); }
+    else                  { currentMove = SWIPE_DIAG_DR;  SerialPort.println("SWIPE_DIAG_DR  ↘  горе-ляво → долу-дясно"); }
   } else {
-    if (!diag)              SerialPort.println("SWIPE_LEFT     →←");
-    else if (minR < minL)   SerialPort.println("SWIPE_DIAG_UL  ↖  долу-дясно → горе-ляво");
-    else                    SerialPort.println("SWIPE_DIAG_DL  ↙  горе-дясно → долу-ляво");
+    if (!diag)            { currentMove = SWIPE_LEFT;     SerialPort.println("SWIPE_LEFT     →←"); }
+    else if (minR < minL) { currentMove = SWIPE_DIAG_UL;  SerialPort.println("SWIPE_DIAG_UL  ↖  долу-дясно → горе-ляво"); }
+    else                  { currentMove = SWIPE_DIAG_DL;  SerialPort.println("SWIPE_DIAG_DL  ↙  горе-дясно → долу-ляво"); }
   }
 }
 
@@ -323,8 +341,10 @@ void loop() {
       if (handGone || timedOut) {
         int32_t delta = (int32_t)vertLastDist - (int32_t)vertStartDist;
         if (delta > (int32_t)VERTICAL_THRESHOLD_MM) {
+          currentMove = VERTICAL_UP;
           SerialPort.println(">>> VERTICAL_UP    ↑  ръката се вдигна");
         } else if (delta < -(int32_t)VERTICAL_THRESHOLD_MM) {
+          currentMove = VERTICAL_DOWN;
           SerialPort.println(">>> VERTICAL_DOWN  ↓  ръката се сниши");
         }
         // Ако delta е в рамките на прага — без жест (само задържане)
@@ -338,6 +358,67 @@ void loop() {
     case COOLDOWN:
       // Изчакай докато ръката напусне ИЛИ изтече таймаутът
       if (!handPresent() || millis() - cooldownStartTime > COOLDOWN_TIMEOUT_MS) {
+        switch (currentMove) {
+          case SWIPE_RIGHT:
+            switch (current_action) {
+              case ACTION_NONE:   break;
+              case ACTION_TV:     break;
+              case ACTION_LIGHT:  break;
+            }
+            break;
+          case SWIPE_LEFT:
+            switch (current_action) {
+              case ACTION_NONE:   break;
+              case ACTION_TV:     break;
+              case ACTION_LIGHT:  break;
+            }
+            break;
+          case SWIPE_DIAG_UR:
+            switch (current_action) {
+              case ACTION_NONE:   break;
+              case ACTION_TV:     break;
+              case ACTION_LIGHT:  break;
+            }
+            break;
+          case SWIPE_DIAG_DR:
+            switch (current_action) {
+              case ACTION_NONE:   break;
+              case ACTION_TV:     break;
+              case ACTION_LIGHT:  break;
+            }
+            break;
+          case SWIPE_DIAG_UL:
+            switch (current_action) {
+              case ACTION_NONE:   break;
+              case ACTION_TV:     break;
+              case ACTION_LIGHT:  break;
+            }
+            break;
+          case SWIPE_DIAG_DL:
+            switch (current_action) {
+              case ACTION_NONE:   break;
+              case ACTION_TV:     break;
+              case ACTION_LIGHT:  break;
+            }
+            break;
+          case VERTICAL_UP:
+            switch (current_action) {
+              case ACTION_NONE:   break;
+              case ACTION_TV:     break;
+              case ACTION_LIGHT:  break;
+            }
+            break;
+          case VERTICAL_DOWN:
+            switch (current_action) {
+              case ACTION_NONE:   break;
+              case ACTION_TV:     break;
+              case ACTION_LIGHT:  break;
+            }
+            break;
+          case MOVE_NONE:
+            break;
+        }
+        currentMove = MOVE_NONE;
         // Нулирай ST lib — данните от движението при вдигане на ръката се изхвърлят
         tof_gestures_initDIRSWIPE_1(400, 0, 1000, &gestureDirSwipeData);
         state = IDLE;
